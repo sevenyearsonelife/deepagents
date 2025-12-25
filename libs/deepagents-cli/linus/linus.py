@@ -1,5 +1,3 @@
-# 需要配置uv环境。不兼容当前的uv！
-
 import os
 import ssl
 from typing import Literal
