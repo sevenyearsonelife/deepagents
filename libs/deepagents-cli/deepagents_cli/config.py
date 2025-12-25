@@ -1,7 +1,9 @@
 """Configuration, constants, and model creation for the CLI."""
 
+import inspect
 import os
 import re
+import ssl
 import sys
 import uuid
 from dataclasses import dataclass
@@ -12,7 +14,12 @@ from rich.console import Console
 
 from deepagents_cli._version import __version__
 
-dotenv.load_dotenv()
+# NOTE:
+# When this package is executed via tool runners (e.g. `uvx`), the package code lives in a
+# temporary environment path. `python-dotenv`'s default lookup may search relative to that
+# path and miss the user's project `.env`. Use CWD-based discovery to reliably load `.env`
+# from where the user runs the CLI (and its parents).
+dotenv.load_dotenv(dotenv.find_dotenv(usecwd=True))
 
 # CRITICAL: Override LANGSMITH_PROJECT to route agent traces to separate project
 # LangSmith reads LANGSMITH_PROJECT at invocation time, so we override it here
@@ -73,6 +80,31 @@ config = {"recursion_limit": 1000}
 
 # Rich console instance
 console = Console(highlight=False)
+
+_original_ssl_create_default_context = ssl.create_default_context
+_tls12_patch_applied = False
+
+
+def _maybe_force_tls12_for_anthropic_base_url(base_url: str | None) -> None:
+    """Force TLSv1.2 when using a custom Anthropic base URL.
+
+    Some Anthropic-compatible gateways/proxy chains fail during TLSv1.3 negotiation.
+    The user's known-good workaround is to cap the default SSL context to TLSv1.2.
+    """
+    global _tls12_patch_applied  # noqa: PLW0603
+    if _tls12_patch_applied:
+        return
+    if not base_url:
+        return
+
+    def _tls12_default_context(*args, **kwargs):  # type: ignore[no-untyped-def]
+        ctx = _original_ssl_create_default_context(*args, **kwargs)
+        if hasattr(ssl, "TLSVersion"):
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        return ctx
+
+    ssl.create_default_context = _tls12_default_context
+    _tls12_patch_applied = True
 
 
 def _find_project_root(start_path: Path | None = None) -> Path | None:
@@ -143,6 +175,7 @@ class Settings:
 
         openai_api_key: OpenAI API key if available
         anthropic_api_key: Anthropic API key if available
+        anthropic_base_url: Optional base URL for Anthropic-compatible APIs
         tavily_api_key: Tavily API key if available
         deepagents_langchain_project: LangSmith project name for deepagents agent tracing
         user_langchain_project: Original LANGSMITH_PROJECT from environment (for user code)
@@ -151,6 +184,7 @@ class Settings:
     # API keys
     openai_api_key: str | None
     anthropic_api_key: str | None
+    anthropic_base_url: str | None
     google_api_key: str | None
     tavily_api_key: str | None
 
@@ -178,6 +212,9 @@ class Settings:
         # Detect API keys
         openai_key = os.environ.get("OPENAI_API_KEY")
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+        anthropic_base_url = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get(
+            "ANTHROPIC_API_URL"
+        )
         google_key = os.environ.get("GOOGLE_API_KEY")
         tavily_key = os.environ.get("TAVILY_API_KEY")
 
@@ -195,6 +232,7 @@ class Settings:
         return cls(
             openai_api_key=openai_key,
             anthropic_api_key=anthropic_key,
+            anthropic_base_url=anthropic_base_url,
             google_api_key=google_key,
             tavily_api_key=tavily_key,
             deepagents_langchain_project=deepagents_langchain_project,
@@ -414,6 +452,8 @@ def _detect_provider(model_name: str) -> str | None:
         return "openai"
     if "claude" in model_lower:
         return "anthropic"
+    if "glm" in model_lower:
+        return "anthropic"
     if "gemini" in model_lower:
         return "google"
     return None
@@ -498,10 +538,18 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        return ChatAnthropic(
-            model_name=model_name,
-            max_tokens=20_000,  # type: ignore[arg-type]
-        )
+        kwargs = {
+            "model_name": model_name,
+            "max_tokens": 20_000,  # type: ignore[arg-type]
+        }
+        if settings.anthropic_base_url:
+            _maybe_force_tls12_for_anthropic_base_url(settings.anthropic_base_url)
+            signature = inspect.signature(ChatAnthropic.__init__)
+            if "base_url" in signature.parameters:
+                kwargs["base_url"] = settings.anthropic_base_url
+            elif "anthropic_api_url" in signature.parameters:
+                kwargs["anthropic_api_url"] = settings.anthropic_base_url
+        return ChatAnthropic(**kwargs)
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
